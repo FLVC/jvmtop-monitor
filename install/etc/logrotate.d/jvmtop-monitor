@@ -1,0 +1,16 @@
+#
+# Log rotation for fedora-related monitoring log.  Handled via (r)syslog.
+# Rotate weekly, keeping a years worth of (compressed) logs.
+#
+/var/log/jvmtop-monitor.log
+{
+    missingok
+    notifempty
+    weekly
+    rotate 51
+    dateext
+    delaycompress
+    compress
+    copytruncate
+    create 0644 root root
+}

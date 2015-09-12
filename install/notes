@@ -1,0 +1,73 @@
+Gary, Bill
+
+I've installed my data collection scripts on islandora-dev,
+islandora-test and islandora-prod.
+
+Pending your approval, I have not changed any of the boot-up
+environment on islandora-prod (see end of this email).
+
+Currently the 'jvmtop-monitor' script is running on all three hosts,
+logging raw data to /var/log/jvmtop-monitor.log - I'm not yet writing
+directly to any RRDBs using rrdtool because I'm not sure I've got it
+right yet, so I'd like to keep the raw data.
+
+Here's what I've done on all three hosts:
+
+Needed a ruby gem, installed:
+
+  gem install syslogger
+
+Modified /etc/rsyslog.conf
+
+ originally:
+
+   *.info;mail.none;authpriv.none;cron.none                /var/log/messages
+
+ becomes:
+
+   *.info;mail.none;authpriv.none;cron.none;local1.none    /var/log/messages
+   local1.*				                   /var/log/jvmtop-monitor.log
+
+ then:
+
+  service rsyslog restart
+  chmod 644 /var/log/jvmtop-monitor.log
+
+Added the file /etc/logrotate.d/jvmtop-monitor
+
+    # Log rotation for fedora-related monitoring log.  Handled via (r)syslog.
+    # Rotate weekly, keeping a years worth of (compressed) logs.
+    #
+    /var/log/jvmtop-monitor.log
+    {
+	missingok
+	notifempty
+	weekly
+	rotate 51
+	dateext
+	delaycompress
+	compress
+	copytruncate
+	create 0644 root root
+    }
+
+Installed  /usr/local/bin/jvmtop-monitor
+
+Installed startup script  /etc/init.d/jvmtop-monitor
+
+    service jvmtop-monitor start
+
+Note: the jvmtop-monitor startup script's  priority is listed
+as 'chkconfig - 93 7'
+
+Pending your approval for the above, I did not do the following on
+islandora-prod, though I have done it on islandora-dev and
+islandora-test:
+
+Since jvmtop-monitor should run after fedora, I changed
+/etc/init.d/fedora's priority to 'chkconfig - 91 9' (was
+'chkconfig - 99 1')
+
+    chkconfig fedora resetpriorities
+    chkconfig --add jvmtop-monitor
+    chkconfig jvmtop-monitor on

@@ -1,0 +1,316 @@
+#!/usr/bin/env ruby
+
+# TODO: add direct rrdtool support
+# TODO: make a non-daemonized version to run at command line
+# TODO: sanity check on jvm version? (likely that any change in the output format will require new gnarly regexps)
+# TODO: sanity check on user? (only the fedora process user is guarenteed to be able to run jvmtop against the process)
+# TODO: require syslogger gem only for ruby 1.8.7? (1.9 and greater have better process support, could have a fallback for them)
+
+require 'rubygems'
+require 'time'
+require 'syslogger'  # special gem install for ruby 1.8.7
+
+class TooQuietError < StandardError; end
+class ReloadRequest < StandardError; end
+
+PROGRAM_NAME             = 'jvmtop-monitor'  # we'll set our process name to this so our init.d startup script can keep track of us.
+SYSLOG_FACILITY          = Syslog::LOG_LOCAL1
+JVMTOP_INTERVAL          =  60 # seconds
+DELAY_FOR_FEDORA_PROCESS = 120 # seconds to wait before checking for a new fedora process
+
+Kernel.trap('PIPE') { exit -4 }
+Kernel.trap('HUP')  { raise ReloadRequest }
+
+def setup_logger
+  @logger = Syslogger.new('jvmtop-monitor', Syslog::LOG_PID, SYSLOG_FACILITY)
+  @logger.level = Logger::INFO
+  log(:info, csv_header)
+end
+
+def log(code, str)
+  case code
+  when :data
+    @logger.info 'DATA: ' + str
+  when :information, :info
+    @logger.info 'INFO: ' + str
+  when :warning, :warn
+    @logger.warn 'WARN: ' + str
+  when :error, :err
+    @logger.error 'ERROR: ' + str
+  else
+    @logger.warn 'UNKN: ' + str
+  end
+end
+
+def find_fedora_process_id
+  pid = nil
+  while pid.nil?
+    `ps aux`.split(/\n+/).each do |p|
+      user, pid, rest = p.split(/\s+/, 3)
+      return pid if (rest =~ /Bootstrap\s+start/i  and user =~ /^fedora$/  and pid =~/^\d+$/)
+    end
+    log(:warning, "Can't find fedora process, sleeping #{DELAY_FOR_FEDORA_PROCESS} seconds.")
+    sleep DELAY_FOR_FEDORA_PROCESS
+  end
+end
+
+def jvmtop_command
+  [ "/usr/bin", "/usr/local/bin" ].each do |dir|
+    path = File.join(dir, "jvmtop")
+    return path if (File.exists? path and File.executable? path)
+  end
+  log(:error, "Fatal error: can't find jvmtop executable.")
+  exit -1
+end
+
+# parse_jvmtop_stanza(str)
+#
+# Extract fields of interest from the text str, which will be one stanza from jvmtop, something like:
+#
+# "\e[2J\e[H JvmTop 0.8.0 alpha - 12:52:03,  amd64,  1 cpus, Linux 2.6.32-57, load avg 0.40
+#  http://code.google.com/p/jvmtop
+#
+#  PID 30968: org.apache.catalina.startup.Bootstrap
+#  ARGS: start
+#  VMARGS: -Djava.util.logging.config.file=/usr/local/fedora/tomcat/conf/log[...]
+#  VM: Sun Microsystems Inc. Java HotSpot(TM) 64-Bit Server VM 1.6.0_45
+#  UP: 107:19m #THR: 88   #THRPEAK: 106  #THRCREATED: 98678 USER: fedora
+#  GC-Time:  0: 9m   #GC-Runs: 851       #TotalLoadedClasses: 14886
+#  CPU: 11.32% GC:  0.00% HEAP:1101m /5939m NONHEAP: 125m / 304m
+#
+#   TID   NAME                                    STATE    CPU  TOTALCPU BLOCKEDBY
+#  Note: Only top 0 threads (according cpu load) are shown!"
+
+# TODO: fish out jvmtop version here as well.
+
+def parse_jvmtop_stanza(str)
+  re = %r{
+           (\d\d:\d\d:\d\d),\s+amd64,.*
+           load\s+avg\s*([\d\.]+).*
+           PID\s*(\d+):.*
+           UP:\s*(.+?)\s*
+           \#THR:\s*(\d+)\s*
+           \#THRPEAK:\s*(\d+)\s*
+           \#THRCREATED:\s*(\d+)\s*.*
+           GC-Time:\s*(.*?)\s*
+           \#GC-Runs:\s*(\d+)\s*
+           \#TotalLoadedClasses:\s*(\d+)\s*
+           CPU:\s*([\d\.]+)%\s*
+           GC:\s*([\d\.]+)%\s*
+           HEAP:\s*(.*?)\s*
+           NONHEAP:\s*(.*?)\s*$
+  }imx
+  if str =~ re
+
+    time, load_avg, pid, uptime, number_threads, peak_number_threads, created_threads,
+    gc_time, gc_runs, loaded_classes, percent_cpu_use, percent_gc_use, heap, non_heap  = $~[1..14]
+
+    time = get_datetime(time)
+
+    uptime = fixup_elapsed_time(uptime)
+    gc_time = fixup_elapsed_time(gc_time)
+    heap_used, heap_ceiling = fixup_memory(heap)
+    non_heap_used, non_heap_ceiling = fixup_memory(non_heap)
+
+
+    return [ time, load_avg.to_f, pid.to_i, uptime, number_threads.to_i, peak_number_threads.to_i, created_threads.to_i,
+             gc_time, gc_runs.to_i, loaded_classes.to_i, percent_cpu_use.to_f, percent_gc_use.to_f,
+             heap_used, heap_ceiling, non_heap_used, non_heap_ceiling ]
+  end
+
+  return []
+end
+
+
+def csv_header
+
+  fields = [ 'time', 'load average', 'pid', 'uptime',
+             'number threads', 'peak threads', 'created threads',
+             'GC minutes', 'GC runs', 'loaded classes',
+             'CPU percentage', 'GC percentage', 'heap used',
+             'heap ceiling', 'non-heap used', 'non-heap ceiling' ]
+
+  return fields.map { |name| "\"#{name}\"" }.join(', ')
+end
+
+# Get epoch time from a recently generated string like "16:53:17".
+# Note it might be a couple of seconds behind Time.now, e.g. we get
+# "23:59:59", but it is now "01:00:01".  So we'll have to double check
+# for this case.  Lastly, we round the result to nearest multiple of
+# JVMTOP_INTERVAL.
+
+def get_datetime(timestr)
+  date = Time.now
+  date_str = date.localtime.iso8601
+
+  if (date_str =~ /(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d:\d\d:\d\d)([+-]\d\d:\d\d)/)
+    year, month, day, wallclock, zone = $~[1..5]
+    if wallclock < timestr
+      (date - 60 * 60 * 24).localtime.iso8601 =~ /(\d\d\d\d)-(\d\d)-(\d\d)/    # year/month/day, yesterday
+      year, month, day = $~[1..3]
+    end
+
+    # Finally, we'll round to the nearest JVMTOP_INTERVAL (normally
+    # minutes) - this is to make the times consistent for RRD, but we
+    # cause a little offset (0..JVMTOP_INTERVAL seconds) from reality,
+    # and that offset very slowly drifts over that range over time.
+    # Close enough for State work.
+
+    epoch_time = Time.parse("#{year}-#{month}-#{day}T#{timestr}#{zone}").strftime("%s").to_i
+    return ((epoch_time + (JVMTOP_INTERVAL + 1)/2) / JVMTOP_INTERVAL) * JVMTOP_INTERVAL
+
+  else
+    log(:error, "Does anyone really know what time it is?")
+    return
+  end
+end
+
+# expecting string like "12:49m" or 276: 1m",  return minutes
+
+def fixup_elapsed_time str
+  return 60 * $1.to_i  + $2.to_i  if str =~ /(\d+):\s*(\d+)m/
+  return
+end
+
+# get string like '103m',  return as number of bytes
+
+def memory_bytes str
+  if str =~ /(\d*)([gmkb]?)/
+    n, multiplier = $1.to_i, $2
+    return case multiplier
+           when '', 'b'
+             n
+           when 'k'
+             n * 1024
+           when 'm'
+             n * 1048576
+           when 'g'
+             n * 1073741824
+           end
+  end
+  return
+end
+
+def fixup_memory(mem)
+  used, ceiling = mem.split('/', 2)
+  return memory_bytes(used.strip).to_i, memory_bytes(ceiling.strip).to_i
+end
+
+# scan_jvmtop_output(buf) receives a multiline string of output read
+# from an active jvmtop process.  We use a regular expression to break
+# the string up into separate stanzas of data, see above for an
+# example.  On each stanza we'll parse out the jvmtop data of
+# interest.
+#
+# Because reading from a pipe often results in partial reads, we take
+# care to leave partial results on the end of buffer 'buf', returning
+# it along with the parsed data.
+
+def scan_jvmtop_output(buf)
+  data = []
+  stanzas = buf.scan(/\e\[2J\e\[H.*? are shown!/m)   # break jvmtop output into distinct stanzas
+  return buf, data if stanzas.empty?                 # nothing here, move along...
+
+  most_recent = stanzas.last
+  buf = buf[(buf.index(most_recent) + most_recent.length )..-1]  # remove everything up to and including the last stanza from buf.
+
+  stanzas.each do |paragraph|
+    record = parse_jvmtop_stanza(paragraph)
+    if record.empty?
+      log(:error, "Error parsing jvmtop output #{paragraph.inspect}.")
+    else
+      data.push record
+    end
+  end
+
+  return buf, data
+end
+
+# TODO: put a timeout here, just in case?
+
+def kill(pid)
+  Process.kill("KILL", pid)   # no reason to be gentle here, jvmtop isn't doing any important cleanup
+  Process.wait(pid)
+rescue Errno::ESRCH
+  return
+end
+
+def children_pids
+  lines = `ps -o pid= -o comm= --ppid #{$$}`.split("\n")
+  return lines.map { |pair| pair.strip.split(/\s+/) }.select { |pid, name| name != "ps" }.map { |pid, name| pid.to_i }
+end
+
+def rundown_children
+  children_pids.each { |child| kill child }
+end
+
+# we're running this from an /etc/init.d script, so we have to disassociate from caller.
+
+def daemonize
+  exit if fork
+  Process.setsid
+  exit if fork
+  Dir.chdir "/"
+  File.umask 0000
+  STDOUT.reopen "/dev/null", "a"
+  STDERR.reopen "/dev/null", "a"
+  $0 = PROGRAM_NAME                   # /etc/init.d script needs to be able to find us
+end
+
+def main_loop
+  check_interval = 15  # seconds
+  response_wait_time = 0
+  buf = ''
+  pid = find_fedora_process_id
+  jvm = IO.popen("#{jvmtop_command}  --threadlimit=0 --delay=#{JVMTOP_INTERVAL} --pid=#{pid}")
+
+  loop do
+
+    # We block up to check_interval seconds or until we get something
+    # readable, not necessarily a complete stanza though! Note that
+    # there's not anything particularly magical about the time in the
+    # SELECT - almost any value could do. If we don't hear anything
+    # from the jvmtop process for too long, however, we kill it and
+    # start another - this is just defensive programming, I've never
+    # seen it in practice.
+
+    results = select([ jvm ], nil, nil, check_interval)
+    response_wait_time += check_interval
+    raise TooQuietError if response_wait_time > 5 * JVMTOP_INTERVAL
+
+    next unless results and results[0].include? jvm
+    response_wait_time = 0
+    buf += jvm.read_nonblock(1024 * 256)
+    buf, data = scan_jvmtop_output(buf)
+    data.each { |d|  log(:data, d.join(' ')) }
+  end
+
+rescue TooQuietError, EOFError,  SignalException, ReloadRequest => e
+  # jvmtop will exit with EOFError when the attached fedora jvm goes away.
+  # we also support a reload on receiving a HUP, and an exit on TERM.
+  # note! KILL will leave subprocesses running
+  rundown_children
+  case e
+  when SignalException
+    log(:warning, "Interrupt.")
+    exit -1
+  when ReloadRequest
+    setup_logger
+    log(:info, "Reloading.")
+  when TooQuietError
+    log(:warning, "The jvmtop process wasn't responding, restarting in #{DELAY_FOR_FEDORA_PROCESS} seconds.")
+    sleep DELAY_FOR_FEDORA_PROCESS
+  when EOFError
+    log(:warning, "The jvmtop process exited, restarting in #{DELAY_FOR_FEDORA_PROCESS} seconds.")
+    sleep DELAY_FOR_FEDORA_PROCESS
+  end
+  retry
+rescue => e
+  log(:error, "Uncaught exception, #{e.class}: #{e.message}")
+  e.backtrace.each { |line| log(:error, line) }
+end
+
+
+daemonize()
+setup_logger()
+main_loop()
