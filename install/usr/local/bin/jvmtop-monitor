@@ -1,5 +1,5 @@
 #!/usr/bin/env ruby
-
+#
 # TODO: add direct rrdtool support
 # TODO: make a non-daemonized version to run at command line
 # TODO: sanity check on jvm version? (likely that any change in the output format will require new gnarly regexps)
@@ -9,13 +9,14 @@
 require 'rubygems'
 require 'time'
 require 'syslogger'  # special gem install for ruby 1.8.7
+require 'English'
 
 class TooQuietError < StandardError; end
 class ReloadRequest < StandardError; end
 
 PROGRAM_NAME             = 'jvmtop-monitor'  # we'll set our process name to this so our init.d startup script can keep track of us.
 SYSLOG_FACILITY          = Syslog::LOG_LOCAL1
-JVMTOP_INTERVAL          = 60 # seconds
+JVMTOP_INTERVAL          =  60 # seconds
 DELAY_FOR_FEDORA_PROCESS = 120 # seconds to wait before checking for a new fedora process
 
 Kernel.trap('PIPE') { exit(-4) }
@@ -227,7 +228,7 @@ def children_pids
 end
 
 def rundown_children
-  children_pids.each { |child| kill child }
+  children_pids.each { |pid| kill pid }
 end
 
 # we're running this from an /etc/init.d script, so we have to disassociate from caller.
@@ -283,10 +284,10 @@ rescue TooQuietError, EOFError, SignalException, ReloadRequest => e
     setup_logger
     log(:info, 'Reloading.')
   when TooQuietError
-    log(:warning, "The jvmtop process wasn't responding, restarting in #{DELAY_FOR_FEDORA_PROCESS} seconds.")
+    log(:warning, "The jvmtop process wasn't responding, restarting jvmtop in #{DELAY_FOR_FEDORA_PROCESS} seconds.")
     sleep DELAY_FOR_FEDORA_PROCESS
   when EOFError
-    log(:warning, "The jvmtop process exited, restarting in #{DELAY_FOR_FEDORA_PROCESS} seconds.")
+    log(:warning, "The jvmtop process exited, restarting jvmtop in #{DELAY_FOR_FEDORA_PROCESS} seconds.")
     sleep DELAY_FOR_FEDORA_PROCESS
   end
   retry
